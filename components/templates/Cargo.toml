@@ -13,6 +13,7 @@ once_cell = { workspace = true }
 roxmltree_to_serde = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }

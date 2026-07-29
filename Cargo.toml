@@ -102,6 +102,7 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 pulldown-cmark-escape = { version = "0.11", default-features = false }
 roxmltree_to_serde = "0.6"
 rayon = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
 relative-path = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
