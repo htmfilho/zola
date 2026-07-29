@@ -317,7 +317,7 @@ The method returns a map containing `width`, `height`, `format`, and `mime`. The
 ### `load_data`
 
 Loads data from a file, URL, or string literal. Supported file types include *toml*, *json*, *csv*, *bibtex*, *yaml*/*yml*, 
-and *xml* and only supports UTF-8 encoding.
+*xml* and *sqlite*/*sqlite3*/*db*. All formats other than *sqlite* only support UTF-8 encoding.
 
 Any other file type will be loaded as plain text.
 
@@ -352,7 +352,7 @@ The snippet below outputs the HTML from a Wikipedia page, or "No data found" if 
 ```
 
 The optional `format` argument allows you to specify and override which data type is contained within the specified file or URL.
-Valid entries are `toml`, `json`, `csv`, `bibtex`, `yaml`, `xml` or `plain`. If the `format` argument isn't specified, then the 
+Valid entries are `toml`, `json`, `csv`, `bibtex`, `yaml`, `xml`, `sqlite` or `plain`. If the `format` argument isn't specified, then the 
 path extension is used. In the case of a literal, `plain` is assumed if `format` is unspecified.
 
 
@@ -441,6 +441,32 @@ Finally, the bibtex data can be accessed from the template as follows:
 ```jinja
 {% set tags = data.bibliographies[0].tags %}
 This was generated using {{ tags.title }}, authored by {{ tags.author }}.
+```
+
+The `sqlite` format runs a SQL query against a local SQLite database file and returns the result set as
+an array of row objects, keyed by column name. It requires a local `path` (a remote `url` or `literal`
+is not supported) and a `query` argument containing the SQL to run.
+
+```jinja
+{% set data = load_data(path="content/blog/store.db", format="sqlite", query="select id, name, description from product") %}
+{% for product in data %}
+  {{ product.id }}: {{ product.name }} - {{ product.description }}
+{% endfor %}
+```
+
+If the file has a `.db`, `.sqlite` or `.sqlite3` extension, the `sqlite` format is detected automatically
+and the `format` argument can be omitted. `BLOB` columns are returned as base64-encoded strings.
+
+Use the optional `params` argument to bind values to the query instead of interpolating them into the
+query string. This avoids SQL injection when a value comes from user input or other untrusted data.
+Parameters are bound positionally, in the order given, to the query's placeholders (`?`, `?1`, `:name`,
+`@name` or `$name`, matched in the order they first appear); each parameter must be a string, number,
+boolean or null.
+
+```jinja
+{% set data = load_data(path="content/blog/store.db", format="sqlite",
+    query="select id, name, description from product where category = ?1 and price < ?2",
+    params=["electronics", 100]) %}
 ```
 
 #### Remote content
