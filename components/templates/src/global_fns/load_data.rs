@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
+use base64::engine::{Engine, general_purpose::STANDARD as standard_b64};
 use csv::Reader;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{blocking::Client, header};
@@ -48,6 +49,7 @@ enum OutputFormat {
     Plain,
     Xml,
     Yaml,
+    Sqlite,
 }
 
 impl FromStr for OutputFormat {
@@ -62,6 +64,7 @@ impl FromStr for OutputFormat {
             "xml" => Ok(OutputFormat::Xml),
             "plain" => Ok(OutputFormat::Plain),
             "yaml" | "yml" => Ok(OutputFormat::Yaml),
+            "sqlite" => Ok(OutputFormat::Sqlite),
             format => Err(format!("Unknown output format {}", format).into()),
         }
     }
@@ -77,6 +80,7 @@ impl OutputFormat {
             OutputFormat::Xml => "text/xml",
             OutputFormat::Plain => "text/plain",
             OutputFormat::Yaml => "application/x-yaml",
+            OutputFormat::Sqlite => "application/x-sqlite",
         })
     }
 }
@@ -133,6 +137,7 @@ impl DataSource {
         Err(GET_DATA_ARGUMENT_ERROR_MESSAGE.into())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_cache_key(
         &self,
         format: &OutputFormat,
@@ -140,6 +145,8 @@ impl DataSource {
         post_body: &Option<String>,
         post_content_type: &Option<String>,
         headers: &Option<Vec<String>>,
+        query: &Option<String>,
+        params: &Option<Vec<Value>>,
     ) -> u64 {
         let mut hasher = DefaultHasher::new();
         format.hash(&mut hasher);
@@ -147,6 +154,9 @@ impl DataSource {
         post_body.hash(&mut hasher);
         post_content_type.hash(&mut hasher);
         headers.hash(&mut hasher);
+        query.hash(&mut hasher);
+        // `Value` doesn't implement `Hash`, so hash its JSON serialization instead
+        params.as_ref().map(|p| serde_json::to_string(p).unwrap_or_default()).hash(&mut hasher);
         self.hash(&mut hasher);
         hasher.finish()
     }
@@ -211,7 +221,7 @@ fn add_headers_from_args(header_args: Option<Vec<String>>) -> Result<HeaderMap> 
 }
 
 /// A Tera function to load data from a file or from a URL
-/// Currently the supported formats are json, toml, csv, yaml, bibtex and plain text
+/// Currently the supported formats are json, toml, csv, yaml, bibtex, sqlite and plain text
 #[derive(Debug)]
 pub struct LoadData {
     base_path: PathBuf,
@@ -275,6 +285,17 @@ impl TeraFn for LoadData {
             args.get("headers"),
             "`load_data`: `headers` needs to be an argument with a list of strings of format <name>=<value>."
         );
+        // `sqlite` format only
+        let query_arg = optional_arg!(
+            String,
+            args.get("query"),
+            "`load_data`: `query` must be a string, if set."
+        );
+        let params_arg = optional_arg!(
+            Vec<Value>,
+            args.get("params"),
+            "`load_data`: `params` must be an array of query parameters, if set."
+        );
 
         // If the file doesn't exist, source is None
         let data_source = match (
@@ -314,11 +335,37 @@ impl TeraFn for LoadData {
             &post_body_arg,
             &post_content_type,
             &headers,
+            &query_arg,
+            &params_arg,
         );
 
         let mut cache = self.result_cache.lock().expect("result cache lock");
         if let Some(cached_result) = cache.get(&cache_key) {
             return Ok(cached_result.clone());
+        }
+
+        // `sqlite` doesn't fit the "load the source as a string, then parse the string"
+        // pipeline below: the path points at a binary database file that we open directly,
+        // and the data we want comes from running `query` against it rather than from the
+        // file's raw contents.
+        if file_format == OutputFormat::Sqlite {
+            let path = match &data_source {
+                DataSource::Path(path) => path.clone(),
+                _ => {
+                    return Err(
+                        "`load_data`: `sqlite` format requires a `path` argument pointing to a local database file".into(),
+                    );
+                }
+            };
+            let query = query_arg.ok_or_else(|| {
+                Error::from("`load_data`: `query` argument is required when `format` is `sqlite`")
+            })?;
+
+            let result_value = load_sqlite(&path, &query, &params_arg.unwrap_or_default());
+            if let Ok(data_result) = &result_value {
+                cache.insert(cache_key, data_result.clone());
+            }
+            return result_value;
         }
 
         let data = match data_source {
@@ -390,6 +437,7 @@ impl TeraFn for LoadData {
             OutputFormat::Xml => load_xml(data),
             OutputFormat::Yaml => load_yaml(data),
             OutputFormat::Plain => to_value(data).map_err(|e| e.into()),
+            OutputFormat::Sqlite => unreachable!("`sqlite` is handled earlier in `call`"),
         };
 
         if let Ok(data_result) = &result_value {
@@ -563,6 +611,89 @@ fn load_xml(xml_data: String) -> Result<Value> {
     let xml_content: Value = roxmltree_to_serde::xml_string_to_json(xml_data, &Default::default())
         .map_err(|e| format!("{:?}", e))?;
     Ok(xml_content)
+}
+
+/// Run `query` against a SQLite database file and convert the result set to a Tera Value
+///
+/// Each row becomes an object keyed by column name, e.g. for
+/// `select id, name from product` the result is:
+/// ```json
+/// [
+///     {"id": 1, "name": "Gutenberg"},
+///     {"id": 2, "name": "Printing"}
+/// ]
+/// ```
+/// BLOB columns are base64-encoded strings.
+///
+/// `params` are bound positionally, in order, to the query's placeholders
+/// (`?`, `?1`, `:name`, `@name` or `$name`, matched in the order they first appear).
+fn load_sqlite(path: &Path, query: &str, params: &[Value]) -> Result<Value> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| format!("`load_data`: unable to open sqlite database {:?}: {}", path, e))?;
+
+    let mut stmt = conn
+        .prepare(query)
+        .map_err(|e| format!("`load_data`: invalid sqlite query: {}", e))?;
+
+    let sqlite_params: Vec<rusqlite::types::Value> =
+        params.iter().map(tera_value_to_sqlite_param).collect::<Result<Vec<_>>>()?;
+
+    let column_names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(sqlite_params), |row| {
+            let mut map = Map::new();
+            for (i, name) in column_names.iter().enumerate() {
+                map.insert(name.clone(), sqlite_value_to_tera(row.get_ref(i)?));
+            }
+            Ok(Value::Object(map))
+        })
+        .map_err(|e| format!("`load_data`: failed to execute sqlite query: {}", e))?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.map_err(|e| format!("`load_data`: error reading sqlite row: {}", e))?);
+    }
+
+    Ok(Value::Array(records))
+}
+
+/// Convert a Tera Value passed via the `params` argument into a value `rusqlite` can bind
+fn tera_value_to_sqlite_param(value: &Value) -> Result<rusqlite::types::Value> {
+    Ok(match value {
+        Value::Null => rusqlite::types::Value::Null,
+        Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rusqlite::types::Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                rusqlite::types::Value::Real(f)
+            } else {
+                return Err(
+                    "`load_data`: sqlite query parameter is a number out of range".into()
+                );
+            }
+        }
+        Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+        Value::Array(_) | Value::Object(_) => {
+            return Err(
+                "`load_data`: sqlite query parameters must be strings, numbers, booleans or null"
+                    .into(),
+            );
+        }
+    })
+}
+
+fn sqlite_value_to_tera(value: rusqlite::types::ValueRef) -> Value {
+    use rusqlite::types::ValueRef;
+
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::Number(i.into()),
+        ValueRef::Real(f) => to_value(f).unwrap_or(Value::Null),
+        ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Value::String(standard_b64.encode(b)),
+    }
 }
 
 #[cfg(test)]
@@ -776,6 +907,8 @@ mod tests {
             &None,
             &None,
             &Some(vec![]),
+            &None,
+            &None,
         );
         let cache_key_2 = DataSource::Path(get_test_file("test.toml")).get_cache_key(
             &OutputFormat::Toml,
@@ -783,6 +916,8 @@ mod tests {
             &None,
             &None,
             &Some(vec![]),
+            &None,
+            &None,
         );
         assert_eq!(cache_key, cache_key_2);
     }
@@ -795,6 +930,8 @@ mod tests {
             &None,
             &None,
             &Some(vec![]),
+            &None,
+            &None,
         );
         let json_cache_key = DataSource::Path(get_test_file("test.json")).get_cache_key(
             &OutputFormat::Toml,
@@ -802,6 +939,8 @@ mod tests {
             &None,
             &None,
             &Some(vec![]),
+            &None,
+            &None,
         );
         assert_ne!(toml_cache_key, json_cache_key);
     }
@@ -814,6 +953,8 @@ mod tests {
             &None,
             &None,
             &Some(vec![]),
+            &None,
+            &None,
         );
         let json_cache_key = DataSource::Path(get_test_file("test.toml")).get_cache_key(
             &OutputFormat::Json,
@@ -821,6 +962,8 @@ mod tests {
             &None,
             &None,
             &Some(vec![]),
+            &None,
+            &None,
         );
         assert_ne!(toml_cache_key, json_cache_key);
     }
@@ -833,6 +976,8 @@ mod tests {
             &None,
             &None,
             &Some(vec!["a=b".to_string()]),
+            &None,
+            &None,
         );
         let header2_cache_key = DataSource::Path(get_test_file("test.toml")).get_cache_key(
             &OutputFormat::Json,
@@ -840,6 +985,8 @@ mod tests {
             &None,
             &None,
             &Some(vec![]),
+            &None,
+            &None,
         );
         assert_ne!(header1_cache_key, header2_cache_key);
     }
@@ -1352,6 +1499,145 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn can_load_sqlite() {
+        let static_fn = LoadData::new(PathBuf::from("../utils/test-files"), None, PathBuf::new());
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), to_value("test.sqlite3").unwrap());
+        args.insert("format".to_string(), to_value("sqlite").unwrap());
+        args.insert(
+            "query".to_string(),
+            to_value("select id, name, price from product order by id").unwrap(),
+        );
+        let result = static_fn.call(&args.clone()).unwrap();
+
+        assert_eq!(
+            result,
+            json!([
+                {"id": 1, "name": "Gutenberg", "price": 42.5},
+                {"id": 2, "name": "Printing", "price": 7.0},
+            ])
+        )
+    }
+
+    #[test]
+    fn can_load_sqlite_with_params() {
+        let static_fn = LoadData::new(PathBuf::from("../utils/test-files"), None, PathBuf::new());
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), to_value("test.sqlite3").unwrap());
+        args.insert("format".to_string(), to_value("sqlite").unwrap());
+        args.insert(
+            "query".to_string(),
+            to_value("select id, name, price from product where price < ?1 order by id").unwrap(),
+        );
+        args.insert("params".to_string(), to_value([10]).unwrap());
+        let result = static_fn.call(&args.clone()).unwrap();
+
+        assert_eq!(result, json!([{"id": 2, "name": "Printing", "price": 7.0}]))
+    }
+
+    #[test]
+    fn sqlite_rejects_object_params() {
+        let static_fn = LoadData::new(PathBuf::from("../utils/test-files"), None, PathBuf::new());
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), to_value("test.sqlite3").unwrap());
+        args.insert("format".to_string(), to_value("sqlite").unwrap());
+        args.insert(
+            "query".to_string(),
+            to_value("select id from product where price < ?1").unwrap(),
+        );
+        args.insert("params".to_string(), to_value([json!({"nope": true})]).unwrap());
+        let result = static_fn.call(&args.clone());
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("sqlite query parameters must be strings, numbers, booleans or null")
+        );
+    }
+
+    #[test]
+    fn sqlite_requires_query_argument() {
+        let static_fn = LoadData::new(PathBuf::from("../utils/test-files"), None, PathBuf::new());
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), to_value("test.sqlite3").unwrap());
+        args.insert("format".to_string(), to_value("sqlite").unwrap());
+        let result = static_fn.call(&args.clone());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("`query` argument is required"));
+    }
+
+    #[test]
+    fn sqlite_requires_path_argument() {
+        let static_fn = LoadData::new(PathBuf::from("../utils/test-files"), None, PathBuf::new());
+        let mut args = HashMap::new();
+        args.insert("literal".to_string(), to_value("not a database").unwrap());
+        args.insert("format".to_string(), to_value("sqlite").unwrap());
+        args.insert("query".to_string(), to_value("select 1").unwrap());
+        let result = static_fn.call(&args.clone());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("requires a `path` argument"));
+    }
+
+    #[test]
+    fn sqlite_invalid_query_errors() {
+        let static_fn = LoadData::new(PathBuf::from("../utils/test-files"), None, PathBuf::new());
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), to_value("test.sqlite3").unwrap());
+        args.insert("format".to_string(), to_value("sqlite").unwrap());
+        args.insert("query".to_string(), to_value("select * from nope").unwrap());
+        let result = static_fn.call(&args.clone());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid sqlite query"));
+    }
+
+    #[test]
+    fn different_cache_key_per_query() {
+        let query1_cache_key = DataSource::Path(get_test_file("test.sqlite3")).get_cache_key(
+            &OutputFormat::Sqlite,
+            Method::Get,
+            &None,
+            &None,
+            &None,
+            &Some("select 1".to_string()),
+            &None,
+        );
+        let query2_cache_key = DataSource::Path(get_test_file("test.sqlite3")).get_cache_key(
+            &OutputFormat::Sqlite,
+            Method::Get,
+            &None,
+            &None,
+            &None,
+            &Some("select 2".to_string()),
+            &None,
+        );
+        assert_ne!(query1_cache_key, query2_cache_key);
+    }
+
+    #[test]
+    fn different_cache_key_per_params() {
+        let params1_cache_key = DataSource::Path(get_test_file("test.sqlite3")).get_cache_key(
+            &OutputFormat::Sqlite,
+            Method::Get,
+            &None,
+            &None,
+            &None,
+            &Some("select * from product where id = ?1".to_string()),
+            &Some(vec![to_value(1).unwrap()]),
+        );
+        let params2_cache_key = DataSource::Path(get_test_file("test.sqlite3")).get_cache_key(
+            &OutputFormat::Sqlite,
+            Method::Get,
+            &None,
+            &None,
+            &None,
+            &Some("select * from product where id = ?1".to_string()),
+            &Some(vec![to_value(2).unwrap()]),
+        );
+        assert_ne!(params1_cache_key, params2_cache_key);
     }
 
     #[test]
